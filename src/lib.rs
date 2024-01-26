@@ -1,15 +1,50 @@
-use std::{fs, path::Path};
-
-use jrsonnet_evaluator::EvaluationState;
+use jrsonnet_evaluator::{apply_tla, function::TlaArg, gc::GcHashMap, manifest::{JsonFormat, ManifestFormat}, tb, trace::{CompactFormat, PathResolver, TraceFormat}, FileImportResolver, State};
+use jrsonnet_parser::IStr;
 use wasm_bindgen::prelude::*;
 
+pub struct VM {
+    state: State,
+    manifest_format: Box<dyn ManifestFormat>,
+    trace_format: Box<dyn TraceFormat>,
+    tla_args: GcHashMap<IStr, TlaArg>,
+}
+
 #[wasm_bindgen]
-pub fn jsonnet(path: &str) -> String {
-    let vm = EvaluationState::default();
-    vm.with_stdlib();
-    let code = fs::read_to_string(path).unwrap();
-    let value = vm
-        .run_in_state(|| vm.evaluate_snippet_raw(Path::new(path).into(), code.into()))
-        .unwrap();
-    serde_json::Value::try_from(&value).unwrap().to_string()
+pub fn jsonnet_make() -> *mut VM {
+    let state = State::default();
+    state.settings_mut().import_resolver = tb!(FileImportResolver::default());
+    state.settings_mut().context_initializer = tb!(jrsonnet_stdlib::ContextInitializer::new(
+        state.clone(),
+        PathResolver::new_cwd_fallback(),
+    ));
+    Box::into_raw(Box::new(VM {
+        state,
+        manifest_format: Box::new(JsonFormat::default()),
+        trace_format: Box::new(CompactFormat::default()),
+        tla_args: GcHashMap::default(),
+    }))
+}
+
+
+#[wasm_bindgen]
+pub fn jsonnet_destroy(vm: *mut VM) {
+    unsafe {
+        let dloc_vm = Box::from_raw(vm);
+        drop(dloc_vm);
+    }
+}
+
+#[wasm_bindgen]
+pub fn jsonnet_evaluate_snippet(vm: *mut VM, filename: &str, snippet: &str) -> String {
+    let vm = unsafe { &mut *vm };
+    match vm.state.evaluate_snippet(filename, snippet)
+    .and_then(|val| apply_tla(vm.state.clone(), &vm.tla_args, val))
+    .and_then(|val| val.manifest(&vm.manifest_format)) {
+        Ok(v) => v,
+        Err(e) => {
+            let mut out  = String::new();
+            vm.trace_format.write_trace(&mut out, &e).unwrap();
+            out
+        }
+    }
 }
